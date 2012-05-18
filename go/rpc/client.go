@@ -1,12 +1,12 @@
 package rpc
 
 import (
+	"errors"
 	"fmt"
+	msgpack "github.com/ngmoco/msgpack-go"
 	"io"
-	msgpack "github.com/msgpack/msgpack-go"
 	"net"
 	"reflect"
-	"errors"
 )
 
 type Session struct {
@@ -27,7 +27,6 @@ func coerce(arguments []interface{}) []interface{} {
 	}
 	return _arguments
 }
-
 
 // CoerceInt takes a reflected value and returns it as an int64
 // panics if not an integer type
@@ -59,7 +58,7 @@ func CoerceUint(v reflect.Value) uint64 {
 }
 
 // Sends a RPC request to the server.
-func (self *Session) SendV(funcName string, arguments []interface{}) (reflect.Value, error) {
+func (self *Session) SendV(funcName string, arguments []interface{}) (interface{}, error) {
 	var msgId = self.nextId
 	self.nextId += 1
 	if self.autoCoercing {
@@ -67,29 +66,20 @@ func (self *Session) SendV(funcName string, arguments []interface{}) (reflect.Va
 	}
 	err := SendRequestMessage(self.conn.(io.Writer), msgId, funcName, arguments)
 	if err != nil {
-		return reflect.Value{}, errors.New("Failed to send a request message: " + err.Error())
+		return nil, errors.New("Failed to send a request message: " + err.Error())
 	}
 	_msgId, result, err := ReceiveResponse(self.conn.(io.Reader))
 	if err != nil {
-		return reflect.Value{}, err
+		return nil, err
 	}
 	if msgId != _msgId {
-		return reflect.Value{}, errors.New(fmt.Sprintf("Message IDs don't match (%d != %d)", msgId, _msgId))
-	}
-	if self.autoCoercing {
-		_result := result
-		if _result.Kind() == reflect.Array || _result.Kind() == reflect.Slice {
-			elemType := _result.Type().Elem()
-			if elemType.Kind() == reflect.Uint8 {
-				result = reflect.ValueOf(string(_result.Interface().([]byte)))
-			}
-		}
+		return nil, errors.New(fmt.Sprintf("Message IDs don't match (%d != %d)", msgId, _msgId))
 	}
 	return result, nil
 }
 
 // Sends a RPC request to the server.
-func (self *Session) Send(funcName string, arguments ...interface{}) (reflect.Value, error) {
+func (self *Session) Send(funcName string, arguments ...interface{}) (interface{}, error) {
 	return self.SendV(funcName, arguments)
 }
 
@@ -125,56 +115,53 @@ func SendRequestMessage(writer io.Writer, msgId int, funcName string, arguments 
 
 // This is a low-level function that is not supposed to be called directly
 // by the user.  Change this if the MessagePack protocol is updated.
-func ReceiveResponse(reader io.Reader) (int, reflect.Value, error) {
-	data, _, err := msgpack.UnpackReflected(reader)
+func ReceiveResponse(reader io.Reader) (int, interface{}, error) {
+	data, _, err := msgpack.UnpackSane(reader)
+
 	if err != nil {
-		return 0, reflect.Value{}, errors.New("Error occurred while receiving a response")
+		return 0, nil, errors.New(fmt.Sprintf("Error occurred while receiving a response: %v", err))
 	}
 
-	msgId, result, err := HandleRPCResponse(data)
-	if err != nil {
-		return 0, reflect.Value{}, err
-	}
-	return msgId, result, nil
+	return HandleRPCResponse(data)
 }
 
 // This is a low-level function that is not supposed to be called directly
 // by the user.  Change this if the MessagePack protocol is updated.
-func HandleRPCResponse(req reflect.Value) (int, reflect.Value, error) {
-	for{
-		_req, ok := req.Interface().([]reflect.Value)
+func HandleRPCResponse(req interface{}) (id int, v interface{}, err error) {
+	for {
+		_req, ok := req.([]interface{})
 		if !ok {
-			break;
+			err = errors.New("Invalid message format; top level not an array")
+			break
 		}
 		if len(_req) != 4 {
-			break;
+			err = errors.New("Invalid message format; array does not have 4 elements")
+			break
 		}
-		msgType := _req[0]
+		msgType := reflect.ValueOf(_req[0])
 		typeOk := msgType.Kind() == reflect.Int || msgType.Kind() == reflect.Int8 || msgType.Kind() == reflect.Int16 || msgType.Kind() == reflect.Int32 || msgType.Kind() == reflect.Int64
 		if !typeOk {
-			break;
+			err = errors.New("Invalid message format; unrecognized type")
+			break
 		}
-		msgId := _req[1]
+		msgId := reflect.ValueOf(_req[1])
 		if msgId.Kind() != reflect.Int && msgId.Kind() != reflect.Int8 && msgId.Kind() != reflect.Int16 && msgId.Kind() != reflect.Int32 && msgId.Kind() != reflect.Int64 {
-			break;
+			err = errors.New("Invalid message format; invalid message id")
+			break
 		}
-		if _req[2].IsValid() {
-			_errorMsg := _req[2]
-			if _errorMsg.Kind() != reflect.Array && _errorMsg.Kind() != reflect.Slice {
-                            break;
-                        }
-                        errorMsg, ok := _errorMsg.Interface().([]uint8)
-                        if !ok {
-                                break;
-                        }
-                        if msgType.Int() != RESPONSE {
-                                break;
-                        }
-                        if errorMsg != nil {
-				return int(msgId.Int()), reflect.Value{}, errors.New(string(errorMsg))
+		if _req[2] != nil {
+			if errorMsg, ok := _req[2].([]uint8); ok {
+				return int(msgId.Int()), nil, errors.New(string(errorMsg))
+			} else {
+				
+			}
+			// this code is weird
+			if msgType.Int() != RESPONSE {
+				err = errors.New("Invalid message format; type not Response")
+				break
 			}
 		}
 		return int(msgId.Int()), _req[3], nil
 	}
-	return 0, reflect.Value{}, errors.New("Invalid message format")
+	return 0, nil, err
 }
